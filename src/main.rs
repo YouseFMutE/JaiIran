@@ -139,13 +139,14 @@ async fn run_destination(args: DestinationArgs) -> Result<()> {
     let certs = load_certs(&args.cert)?;
     let key = load_key(&args.key)?;
 
-    let mut tls_config = rustls::ServerConfig::builder()
+    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+    ])
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("build server TLS config")?;
 
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
-    tls_config.versions = vec![&rustls::version::TLS13];
     if args.tls_fragment > 0 {
         tls_config.max_fragment_size = Some(args.tls_fragment);
     }
@@ -269,8 +270,9 @@ where
         let mut offset = 0;
         send_stream.reserve_capacity(read);
         while offset < read {
-            let capacity = poll_fn(|cx| send_stream.poll_capacity(cx)).await;
-            let capacity = capacity.ok_or_else(|| anyhow!("send stream closed"))?;
+            let capacity = poll_fn(|cx| send_stream.poll_capacity(cx))
+                .await
+                .ok_or_else(|| anyhow!("send stream closed"))??;
             if capacity == 0 {
                 send_stream.reserve_capacity(read - offset);
                 continue;
@@ -455,7 +457,8 @@ async fn connect_tls_stream(config: &BridgeConfig) -> Result<Box<dyn AsyncReadWr
             let tls_config = build_rustls_client_config(config)?;
             let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
             let server_name = pki_types::ServerName::try_from(config.sni.as_str())
-                .context("invalid SNI")?;
+                .context("invalid SNI")?
+                .to_owned();
             let tls = connector.connect(server_name, tcp).await?;
             Ok(Box::new(tls))
         }
@@ -498,10 +501,6 @@ async fn connect_boring(
     builder.set_alpn_protos(b"\x02h2")?;
     builder.set_min_proto_version(Some(boring::ssl::SslVersion::TLS1_3))?;
 
-    if config.tls_fragment > 0 {
-        builder.set_max_send_fragment(config.tls_fragment)?;
-    }
-
     let cipher_list = match config.tls_profile {
         TlsProfile::Chrome => "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256",
         TlsProfile::Firefox => "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384",
@@ -512,11 +511,9 @@ async fn connect_boring(
     }
 
     let connector = builder.build();
-    let ssl = connector
-        .configure()?
-        .into_ssl(&config.sni)?;
+    let connect_config = connector.configure()?;
 
-    let stream = tokio_boring::connect(ssl, tcp)
+    let stream = tokio_boring::connect(connect_config, &config.sni, tcp)
         .await
         .context("boring tls connect")?;
 
@@ -527,14 +524,15 @@ fn build_rustls_client_config(config: &BridgeConfig) -> Result<rustls::ClientCon
     let mut root_store = rustls::RootCertStore::empty();
 
     if config.insecure {
-        let mut client_config = rustls::ClientConfig::builder()
+        let mut client_config = rustls::ClientConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS13,
+        ])
             .with_root_certificates(root_store)
             .with_no_client_auth();
         client_config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoVerifier));
         client_config.alpn_protocols = vec![b"h2".to_vec()];
-        client_config.versions = vec![&rustls::version::TLS13];
         if config.tls_fragment > 0 {
             client_config.max_fragment_size = Some(config.tls_fragment);
         }
@@ -548,12 +546,13 @@ fn build_rustls_client_config(config: &BridgeConfig) -> Result<rustls::ClientCon
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let mut client_config = rustls::ClientConfig::builder()
+    let mut client_config = rustls::ClientConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+    ])
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
     client_config.alpn_protocols = vec![b"h2".to_vec()];
-    client_config.versions = vec![&rustls::version::TLS13];
     if config.tls_fragment > 0 {
         client_config.max_fragment_size = Some(config.tls_fragment);
     }
@@ -561,6 +560,7 @@ fn build_rustls_client_config(config: &BridgeConfig) -> Result<rustls::ClientCon
     Ok(client_config)
 }
 
+#[derive(Debug)]
 struct NoVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
@@ -573,6 +573,40 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         _now: pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
     }
 }
 
